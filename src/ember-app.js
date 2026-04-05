@@ -17,7 +17,6 @@ import createDocument from './document.js';
 import Result from './result.js';
 import FastBootInfo from './ssr-info.js';
 import { loadConfig } from './ssr-schema.js';
-import Queue from './utils/queue.js';
 import SsrPaths from './utils/ssr-paths.js';
 
 const { statSync, readFile } = fs;
@@ -39,7 +38,6 @@ export default class EmberApp {
    * @param {Object} options
    * @param {string} options.distPath - path to the built Ember application
    * @param {Function} [options.buildSandboxGlobals] - the function used to build the final set of global properties accesible within the sandbox
-   * @param {Number} [options.maxSandboxQueueSize] - maximum sandbox queue size when using buildSandboxPerRequest flag.
    */
   constructor(options) {
     this.buildSandboxGlobals = options.buildSandboxGlobals || defaultBuildSandboxGlobals;
@@ -68,30 +66,10 @@ export default class EmberApp {
 
     this.scripts = config.scripts;
 
-    // default to 1 if maxSandboxQueueSize is not defined so the sandbox is pre-warmed when process comes up
-    const maxSandboxQueueSize = options.maxSandboxQueueSize || 1;
-    // Ensure that the dist files can be evaluated and the `Ember.Application`
-    // instance created.
-    this.buildSandboxQueue(maxSandboxQueueSize);
-  }
-
-  /**
-   * @private
-   *
-   * Function to build queue of sandboxes which is later leveraged if application is using `buildSandboxPerRequest`
-   * flag. This is an optimization to help with performance.
-   *
-   * @param {Number} maxSandboxQueueSize - maximum size of queue (this is should be a derivative of your QPS)
-   */
-  buildSandboxQueue(maxSandboxQueueSize) {
-    this._sandboxApplicationInstanceQueue = new Queue(
-      () => this.buildNewApplicationInstance(),
-      maxSandboxQueueSize
-    );
-
-    for (let i = 0; i < maxSandboxQueueSize; i++) {
-      this._sandboxApplicationInstanceQueue.enqueue();
-    }
+    // Kick off async initialization: build the vm.Context once, compile all
+    // modules, create the Ember Application and boot it. All of this happens
+    // once and is reused across every request.
+    this._ready = this._initSharedApp();
   }
 
   /**
@@ -187,30 +165,28 @@ export default class EmberApp {
    * Perform any cleanup that is needed
    */
   destroy() {
+    if (this._sharedApp) {
+      this._sharedApp.destroy();
+      this._sharedApp = null;
+    }
     this._sharedContext = null;
-    this._createSsrApp = null;
-  }
-
-  /**
-   * Builds a new application instance context as a micro-task.
-   */
-  buildNewApplicationInstance() {
-    return Promise.resolve().then(() => this.buildApp())
   }
 
   /**
    * @private
    *
-   * One-time initialization of the shared vm.Context and compiled modules.
-   * Subsequent calls to buildApp() reuse the context and factory function,
-   * avoiding the vm.SourceTextModule memory leak that occurs when new contexts
-   * are created per request.
+   * One-time initialization: build the vm.Context, compile all modules,
+   * create the Ember Application and boot it. The Application is reused
+   * across all requests — only ApplicationInstances are created per request.
+   * This avoids both the vm.SourceTextModule leak (context created once) and
+   * the per-request Application overhead (hundreds of factory registrations).
    */
-  async _initSharedContext() {
+  async _initSharedApp() {
     const context = this.buildContext();
 
     debug('adding files to sandbox');
 
+    let createSsrApp;
     for (let script of this.scripts) {
       if (!script) {
         continue;
@@ -222,7 +198,7 @@ export default class EmberApp {
       );
       try {
         await module.evaluate();
-        this._createSsrApp ??= module.namespace?.createSsrApp;
+        createSsrApp ??= module.namespace?.createSsrApp;
         await Promise.resolve(); // Run microtasks?
       } catch (e) {
         console.log('ssr exception', e);
@@ -232,53 +208,24 @@ export default class EmberApp {
 
     debug('files evaluated');
 
-    if (!this._createSsrApp || typeof this._createSsrApp !== 'function') {
+    if (!createSsrApp || typeof createSsrApp !== 'function') {
       console.log(
         'Failed to load Ember app from app.js, make sure it was built for FastBoot with the `ember fastboot:build` command.'
       );
       return;
     }
 
-    this._sharedContext = context;
-  }
-
-  /**
-   * @typedef AppContext
-   * @property {Ember.Application} app
-   * @property {{}} context vm context globals
-   */
-  /**
-   * @private
-   *
-   * Creates a new `Application` by reusing the shared vm.Context and calling
-   * the cached createSsrApp factory. A fresh document is created per request
-   * to ensure clean rendering state.
-   *
-   * @returns {Promise.<AppContext>} instance
-   */
-  async buildApp() {
-    // First call: compile the context and modules once
-    if (!this._sharedContext) {
-      await this._initSharedContext();
-    }
-
-    if (!this._createSsrApp) {
-      return null;
-    }
-
-    // Fresh document per request to ensure clean rendering state.
-    // The doc is also returned directly so that visit() can capture it
-    // without racing against a concurrent buildApp() call that would
-    // overwrite context.document.
-    const doc = this.buildSandboxDocument();
-    this._sharedContext.document = doc;
-
-    const configMeta = doc.querySelector(`meta[name="${this.appName}/config/environment"]`);
+    // Remove the config meta from the initial document (used during module eval)
+    const configMeta = context.document.querySelector(`meta[name="${this.appName}/config/environment"]`);
     if (configMeta) configMeta.remove();
 
-    debug('creating application');
+    debug('creating and booting application');
 
-    return { app: this._createSsrApp(), context: this._sharedContext, doc };
+    const app = createSsrApp();
+    await app.boot();
+
+    this._sharedContext = context;
+    this._sharedApp = app;
   }
 
   async buildScript(filePath, context, link, importModuleDynamically, source = null) {
@@ -361,39 +308,9 @@ export default class EmberApp {
   /**
    * @private
    *
-   * @param {AppContext} appContext - the instance that is pre-warmed or built on demand
-   * @param {Boolean} isAppInstancePreBuilt - boolean representing how the instance was built
-   *
-   * @returns {Object}
-   */
-  getAppInstanceInfo(appContext, isAppInstancePreBuilt = true) {
-    return { appContext, isSandboxPreBuilt: isAppInstancePreBuilt };
-  }
-
-  /**
-   * @private
-   *
-   * Get the new sandbox off if it is being created, otherwise create a new one on demand.
-   * The latter is needed when the current request hasn't finished or wasn't build with sandbox
-   * per request turned on and a new request comes in.
-   */
-  async getNewApplicationInstance() {
-    const queueObject = this._sandboxApplicationInstanceQueue.dequeue();
-    const app = await queueObject.item;
-
-    return this.getAppInstanceInfo(app, queueObject.isItemPreBuilt);
-  }
-
-  /**
-   * @private
-   *
-   * Main function that creates the app instance for every `visit` request, boots
-   * the app instance and then visits the given route and destroys the app instance
-   * when the route is finished its render cycle.
-   *
-   * Ember apps can manually defer rendering in FastBoot mode if they're waiting
-   * on something async the router doesn't know about. This function fetches
-   * that promise for deferred rendering from the app.
+   * Main function that creates an ApplicationInstance for every `visit` request,
+   * boots it and then visits the given route. Only the instance is destroyed
+   * after rendering — the Application stays alive across requests.
    *
    * @param {string} path the URL path to render, like `/photos/1`
    * @param {Object} fastbootInfo An object holding per request info
@@ -403,10 +320,7 @@ export default class EmberApp {
    * @return {Promise<instance>} instance
    */
   async _visit(path, fastbootInfo, bootOptions, result) {
-    const app = result.applicationInstance;
-    await app.boot();
-
-    let instance = await app.buildInstance();
+    let instance = await this._sharedApp.buildInstance();
     result.applicationInstanceInstance = instance;
 
     registerFastBootInfo(fastbootInfo, instance);
@@ -439,42 +353,46 @@ export default class EmberApp {
    * @returns {Promise<Result>} result
    */
   async visit(path, options) {
+    // Wait for the shared Application to be ready
+    await this._ready;
+
+    if (!this._sharedApp) {
+      throw new Error('SSR application failed to initialize');
+    }
+
     const req = options.request;
     const res = options.response;
     const html = options.html || this.html;
     const disableShoebox = options.disableShoebox || false;
     const destroyAppInstanceInMs = parseInt(options.destroyAppInstanceInMs, 10);
 
+    // Fresh document per request
+    const doc = this.buildSandboxDocument();
+    this._sharedContext.document = doc;
+
+    const configMeta = doc.querySelector(`meta[name="${this.appName}/config/environment"]`);
+    if (configMeta) configMeta.remove();
+
     const fastbootInfo = new FastBootInfo(req, res, {
       hostWhitelist: this.hostWhitelist,
       metadata: options.metadata || {},
     });
 
-    const { appContext, isSandboxPreBuilt }
-      = await this.getNewApplicationInstance();
-
-    const { app, doc } = appContext;
     const result = new Result(doc, html, fastbootInfo);
 
-    // entangle the specific application instance to the result, so it can be
-    // destroyed when result._destroy() is called (after the visit is
-    // completed)
-    result.applicationInstance = app;
-
-    // we add analytics information about the current request to know
-    // whether it used sandbox from the pre-built queue or built on demand.
-    result.analytics.usedPrebuiltSandbox = isSandboxPreBuilt;
+    // The Application is NOT destroyed per request — only the instance is.
+    // Store a reference so Result._destroy() can clean up the instance.
+    result.applicationInstance = null;
 
     const shouldRender = options.shouldRender !== undefined ? options.shouldRender : true;
     const bootOptions = buildBootOptions(shouldRender, doc);
 
-    // TODO: Use Promise.race here
     let destroyAppInstanceTimer;
     if (destroyAppInstanceInMs > 0) {
-      // start a timer to destroy the appInstance forcefully in the given ms.
-      // This is a failure mechanism so that node process doesn't get wedged if the `visit` never completes.
       destroyAppInstanceTimer = setTimeout(function() {
-        if (result._destroy()) {
+        if (result.applicationInstanceInstance && !result.isDestroyed) {
+          result.applicationInstanceInstance.destroy();
+          result.isDestroyed = true;
           result.error = new Error(
             'App instance was forcefully destroyed in ' + destroyAppInstanceInMs + 'ms'
           );
@@ -486,7 +404,6 @@ export default class EmberApp {
       await this._visit(path, fastbootInfo, bootOptions, result);
 
       if (!disableShoebox) {
-        // if shoebox is not disabled, then create the shoebox and send API data
         createShoebox(doc, fastbootInfo);
       }
     } catch (error) {
@@ -494,15 +411,14 @@ export default class EmberApp {
       result.error = error;
     } finally {
       result._finalize();
-      // ensure we invoke `Ember.Application.destroy()` and
-      // `Ember.ApplicationInstance.destroy()`, but use `result._destroy()` so
-      // that the `result` object's internal `this.isDestroyed` flag is correct
-      result._destroy();
+
+      // Only destroy the ApplicationInstance, not the Application
+      if (result.applicationInstanceInstance) {
+        result.applicationInstanceInstance.destroy();
+      }
+      result.isDestroyed = true;
 
       clearTimeout(destroyAppInstanceTimer);
-
-      // build a new sandbox for the next incoming request
-      this._sandboxApplicationInstanceQueue.enqueue();
     }
 
     return result;
