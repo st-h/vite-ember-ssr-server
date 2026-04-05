@@ -187,6 +187,8 @@ export default class EmberApp {
    * Perform any cleanup that is needed
    */
   destroy() {
+    this._sharedContext = null;
+    this._createSsrApp = null;
   }
 
   /**
@@ -197,20 +199,15 @@ export default class EmberApp {
   }
 
   /**
-   * @typedef AppContext
-   * @property {Ember.Application} app
-   * @property {{}} context vm context globals
-   */
-  /**
    * @private
    *
-   * Creates a new `Application`
-   *
-   * @returns {Promise.<AppContext>} instance
+   * One-time initialization of the shared vm.Context and compiled modules.
+   * Subsequent calls to buildApp() reuse the context and factory function,
+   * avoiding the vm.SourceTextModule memory leak that occurs when new contexts
+   * are created per request.
    */
-  async buildApp() {
+  async _initSharedContext() {
     const context = this.buildContext();
-    let createSsrApp;
 
     debug('adding files to sandbox');
 
@@ -225,31 +222,63 @@ export default class EmberApp {
       );
       try {
         await module.evaluate();
-        createSsrApp ??= module.namespace?.createSsrApp;
+        this._createSsrApp ??= module.namespace?.createSsrApp;
         await Promise.resolve(); // Run microtasks?
       } catch (e) {
         console.log('ssr exception', e);
-        return null;
+        return;
       }
     }
 
     debug('files evaluated');
 
-    const configMeta = context.document.querySelector(`meta[name="${this.appName}/config/environment"]`);
-    if (configMeta) configMeta.remove();
-
-    // If the application factory couldn't be found, throw an error
-    if (!createSsrApp || typeof createSsrApp !== 'function') {
+    if (!this._createSsrApp || typeof this._createSsrApp !== 'function') {
       console.log(
         'Failed to load Ember app from app.js, make sure it was built for FastBoot with the `ember fastboot:build` command.'
       );
+      return;
+    }
+
+    this._sharedContext = context;
+  }
+
+  /**
+   * @typedef AppContext
+   * @property {Ember.Application} app
+   * @property {{}} context vm context globals
+   */
+  /**
+   * @private
+   *
+   * Creates a new `Application` by reusing the shared vm.Context and calling
+   * the cached createSsrApp factory. A fresh document is created per request
+   * to ensure clean rendering state.
+   *
+   * @returns {Promise.<AppContext>} instance
+   */
+  async buildApp() {
+    // First call: compile the context and modules once
+    if (!this._sharedContext) {
+      await this._initSharedContext();
+    }
+
+    if (!this._createSsrApp) {
       return null;
     }
 
+    // Fresh document per request to ensure clean rendering state.
+    // The doc is also returned directly so that visit() can capture it
+    // without racing against a concurrent buildApp() call that would
+    // overwrite context.document.
+    const doc = this.buildSandboxDocument();
+    this._sharedContext.document = doc;
+
+    const configMeta = doc.querySelector(`meta[name="${this.appName}/config/environment"]`);
+    if (configMeta) configMeta.remove();
+
     debug('creating application');
 
-    // Otherwise, return a new `Ember.Application` instance
-    return { app: createSsrApp(), context };
+    return { app: this._createSsrApp(), context: this._sharedContext, doc };
   }
 
   async buildScript(filePath, context, link, importModuleDynamically, source = null) {
@@ -424,9 +453,7 @@ export default class EmberApp {
     const { appContext, isSandboxPreBuilt }
       = await this.getNewApplicationInstance();
 
-    const { app, context } = appContext;
-
-    const doc = context.document;
+    const { app, doc } = appContext;
     const result = new Result(doc, html, fastbootInfo);
 
     // entangle the specific application instance to the result, so it can be
