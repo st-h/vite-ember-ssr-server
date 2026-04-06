@@ -1,16 +1,10 @@
-import Module, { builtinModules } from 'node:module';
-import { dirname, resolve, normalize } from 'node:path';
-import URL from 'node:url';
+import Module from 'node:module';
+import { dirname } from 'node:path';
 import vm from 'node:vm';
 
-const nodeBuiltins = new Set([
-  ...builtinModules,
-  ...builtinModules.map(m => `node:${m}`),
-]);
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import { HTMLElement } from 'linkedom/worker';
-import sourceMapSupport from 'source-map-support';
 
 import debug from './debug.js';
 import createDocument from './document.js';
@@ -19,26 +13,21 @@ import FastBootInfo from './ssr-info.js';
 import { loadConfig } from './ssr-schema.js';
 import SsrPaths from './utils/ssr-paths.js';
 
-const { statSync, readFile } = fs;
+const { readFileSync } = fs;
 const require = Module.createRequire(import.meta.url);
 
 const noop = function() {};
 
 /**
- * @private
+ * SSR using vm.Script with per-request vm.createContext.
  *
- * The `EmberApp` class serves as a non-sandboxed wrapper around a sandboxed
- * `Ember.Application`. This bridge allows the FastBoot to quickly spin up new
- * `ApplicationInstances` initialized at a particular route, then destroy them
- * once the route has finished rendering.
+ * Key design: NOTHING is set on the real global object per request.
+ * Each request gets its own vm.Context with its own document, window, etc.
+ * The vm.Script is compiled once and reused across all contexts.
+ * The real global (and its timer infrastructure) never references per-request
+ * objects, so V8 can GC the contexts fully.
  */
 export default class EmberApp {
-  /**
-   * Create a new EmberApp.
-   * @param {Object} options
-   * @param {string} options.distPath - path to the built Ember application
-   * @param {Function} [options.buildSandboxGlobals] - the function used to build the final set of global properties accesible within the sandbox
-   */
   constructor(options) {
     this.buildSandboxGlobals = options.buildSandboxGlobals || defaultBuildSandboxGlobals;
 
@@ -64,18 +53,21 @@ export default class EmberApp {
       this.config = allConfig;
     }
 
-    this.scripts = config.scripts;
+    this.scripts = config.scripts.filter(Boolean);
 
-    // Kick off async initialization: build the vm.Context once, compile all
-    // modules, create the Ember Application and boot it. All of this happens
-    // once and is reused across every request.
-    this._ready = this._initSharedApp();
+    // Compile scripts once. vm.Script can be run in multiple contexts.
+    // CJS wrapper provides exports/require/module as local variables.
+    this._compiledScripts = this.scripts.map(scriptPath => {
+      const source = readFileSync(scriptPath, { encoding: 'utf8' });
+      debug('compiling script %s', scriptPath);
+      const wrapped = `(function(exports, require, module, __filename, __dirname) {\n${source}\n})`;
+      return { script: new vm.Script(wrapped, { filename: scriptPath }), filename: scriptPath };
+    });
   }
 
   /**
-   * @private
-   *
-   * Builds and initializes a new sandbox to run the Ember application in.
+   * Build a fresh vm.Context for one request. All per-request state
+   * (document, window, etc.) lives here, NOT on the real global.
    */
   buildContext() {
     const { ssrPaths, buildSandboxGlobals, config, appName, sandboxRequire } = this;
@@ -83,53 +75,84 @@ export default class EmberApp {
     let console = this.buildWrappedConsole();
 
     function ssrConfig(key) {
-      if (!key) {
-        // default to app key
-        key = appName;
-      }
-
-      if (config) {
-        return { default: config[key] };
-      } else {
-        return { default: undefined };
-      }
+      if (!key) key = appName;
+      return config ? { default: config[key] } : { default: undefined };
     }
 
     const Ssr = {
       appConfig: config[appName],
       require: sandboxRequire,
       config: ssrConfig,
-
-      get distPath() {
-        return ssrPaths.clientPath;
-      },
+      get distPath() { return ssrPaths.clientPath; },
     };
 
+    const sandboxCjsRequire = (specifier) => {
+      try { return require(specifier); }
+      catch { return sandboxRequire(specifier); }
+    };
+
+    const doc = this.buildSandboxDocument();
+
+    // Immediate-execution timers: setTimeout(fn, 0) calls fn() synchronously.
+    // This lets Ember's run loop flush and app.destroy() complete immediately
+    // without creating real timer entries in Node.js's timerListMap (which
+    // retain closures and prevent GC of the vm.Context).
+    let nextTimerId = 1;
+    const sandboxSetTimeout = (fn, delay, ...args) => {
+      const id = nextTimerId++;
+      if (!delay) {
+        try { fn(...args); } catch(e) { /* swallow errors from scheduled cleanup */ }
+      }
+      return id;
+    };
+    const sandboxClearTimeout = noop;
+    const sandboxSetInterval = noop;
+    const sandboxClearInterval = noop;
+
+    // CRITICAL: All functions passed into the sandbox must be wrapped.
+    // Direct references to globalThis functions (fetch, AbortController, etc.)
+    // create a retention chain: vm.Context → function → function's execution
+    // context → real globalThis → timerListMap. This prevents GC of the
+    // vm.Context after the request completes. Thin wrappers break the chain.
     const globals = buildSandboxGlobals({
       console,
-      setTimeout,
-      clearTimeout,
-      structuredClone,
+      setTimeout: sandboxSetTimeout,
+      clearTimeout: sandboxClearTimeout,
+      setInterval: sandboxSetInterval,
+      clearInterval: sandboxClearInterval,
+      structuredClone: (...args) => structuredClone(...args),
       AbortController,
-      URL,
+      URL: globalThis.URL,
+      fetch: (...args) => globalThis.fetch(...args),
+      Headers: globalThis.Headers,
+      Request: globalThis.Request,
+      Response: globalThis.Response,
+      ReadableStream: globalThis.ReadableStream,
+      WritableStream: globalThis.WritableStream,
+      TransformStream: globalThis.TransformStream,
       addEventListener: noop,
       removeEventListener: noop,
-      document: this.buildSandboxDocument(),
+      document: doc,
       HTMLElement,
       navigator: { userAgent: '' },
 
-      // Convince jQuery not to assume it's in a browser
+      require: sandboxCjsRequire,
       module: { exports: {} },
 
-      sourceMapSupport,
-      process,
+      process: { env: process.env },
       Ssr,
       FastBoot: Ssr,
     });
 
-    // Set the global as `window`.
+    // Re-wrap fetch after buildSandboxGlobals in case the user passed
+    // the raw globalThis.fetch which would create a retention chain.
+    if (globals.fetch === globalThis.fetch) {
+      globals.fetch = (...args) => globalThis.fetch(...args);
+    }
+
+    globals.exports = globals.module.exports;
     globals.window = globals;
-    globals.window.self = globals;
+    globals.self = globals;
 
     return vm.createContext(globals);
   }
@@ -148,184 +171,63 @@ export default class EmberApp {
 
   buildWrappedConsole() {
     let wrappedConsole = Object.create(console);
-
     wrappedConsole.error = function(...args) {
-      console.error.apply(
-        console,
-        args.map(function(a) {
-          return typeof a === 'string' ? chalk.red(a) : a;
-        })
-      );
+      console.error.apply(console, args.map(a => typeof a === 'string' ? chalk.red(a) : a));
     };
-
     return wrappedConsole;
   }
 
-  /**
-   * Perform any cleanup that is needed
-   */
   destroy() {
-    if (this._sharedApp) {
-      this._sharedApp.destroy();
-      this._sharedApp = null;
-    }
-    this._sharedContext = null;
+    this._compiledScripts = null;
   }
 
   /**
-   * @private
-   *
-   * One-time initialization: build the vm.Context, compile all modules,
-   * create the Ember Application and boot it. The Application is reused
-   * across all requests — only ApplicationInstances are created per request.
-   * This avoids both the vm.SourceTextModule leak (context created once) and
-   * the per-request Application overhead (hundreds of factory registrations).
+   * Run the pre-compiled CJS scripts in a fresh context.
+   * Returns the Ember app + context (for cleanup).
    */
-  async _initSharedApp() {
+  async buildApp() {
     const context = this.buildContext();
 
-    debug('adding files to sandbox');
+    debug('running scripts in sandbox');
 
-    let createSsrApp;
-    for (let script of this.scripts) {
-      if (!script) {
-        continue;
-      }
-      debug('evaluating file %s', script);
-      const { link, importModuleDynamically } = this.buildLink(context, script);
-      const module = await this.buildScript(
-        script, context, link, importModuleDynamically,
-      );
+    for (const { script, filename } of this._compiledScripts) {
       try {
-        await module.evaluate();
-        createSsrApp ??= module.namespace?.createSsrApp;
-        await Promise.resolve(); // Run microtasks?
+        const factory = script.runInContext(context);
+        factory(
+          context.module.exports,
+          context.require,
+          context.module,
+          filename,
+          dirname(filename),
+        );
       } catch (e) {
         console.log('ssr exception', e);
-        return;
+        return null;
       }
     }
 
-    debug('files evaluated');
+    debug('scripts evaluated');
 
-    if (!createSsrApp || typeof createSsrApp !== 'function') {
-      console.log(
-        'Failed to load Ember app from app.js, make sure it was built for FastBoot with the `ember fastboot:build` command.'
-      );
-      return;
-    }
-
-    // Remove the config meta from the initial document (used during module eval)
     const configMeta = context.document.querySelector(`meta[name="${this.appName}/config/environment"]`);
     if (configMeta) configMeta.remove();
 
-    debug('creating and booting application');
+    const createSsrApp = context.module.exports.createSsrApp;
 
-    const app = createSsrApp();
+    if (!createSsrApp || typeof createSsrApp !== 'function') {
+      console.log('Failed to load Ember app — createSsrApp not found on module.exports.');
+      return null;
+    }
+
+    debug('creating application');
+
+    return { app: createSsrApp(), context };
+  }
+
+  async _visit(path, fastbootInfo, bootOptions, result) {
+    const app = result.applicationInstance;
     await app.boot();
 
-    this._sharedContext = context;
-    this._sharedApp = app;
-  }
-
-  async buildScript(filePath, context, link, importModuleDynamically, source = null) {
-    source ??= await readFile(filePath, { encoding: 'utf8' });
-    const module = new vm.SourceTextModule(source, {
-      context,
-      identifier: filePath,
-      importModuleDynamically,
-    });
-    await module.link(link);
-    return module;
-  }
-
-  buildLink(context, defaultBase) {
-    const importModuleDynamically = async specifier => {
-      return (await link(specifier)).namespace;
-    };
-    const moduleCache = new Map();
-    const link = async (specifier, referencingModule) => {
-      if (nodeBuiltins.has(specifier)) {
-        if (moduleCache.has(specifier)) return moduleCache.get(specifier);
-        const canonical = specifier.startsWith('node:') ? specifier : `node:${specifier}`;
-        const native = await import(canonical);
-        const exportNames = Object.keys(native);
-        const synth = new vm.SyntheticModule(
-          ['default', ...exportNames.filter(k => k !== 'default')],
-          function () {
-            this.setExport('default', native.default ?? native);
-            for (const key of exportNames) {
-              if (key !== 'default') this.setExport(key, native[key]);
-            }
-          },
-          { context, identifier: canonical },
-        );
-        await synth.link(() => {});
-        await synth.evaluate();
-        moduleCache.set(specifier, synth);
-        return synth;
-      }
-      const base = referencingModule?.identifier || defaultBase;
-      const identifier = await this.resolveImport(specifier, base);
-      // Cache compiled modules by resolved path. Without this, every
-      // dynamic import during SSR compiles a new SourceTextModule,
-      // which are never freed and accumulate until OOM.
-      if (moduleCache.has(identifier)) return moduleCache.get(identifier);
-      const module = await this.buildScript(
-        identifier, context, link, importModuleDynamically,
-      );
-      await module.evaluate();
-      moduleCache.set(identifier, module);
-      return module;
-    };
-    return { link, importModuleDynamically };
-  }
-
-  async resolveImport(specifier, importerPath) {
-    if (!specifier.startsWith('.')) {
-      return require.resolve(specifier);
-    }
-    const resolvedPath = normalize(resolve(dirname(importerPath), specifier));
-    let foundPath;
-    const attempts = [
-      { },
-      { file: 'index.js' },
-      { ext: '.mjs' },
-      { ext: '.js' }
-    ];
-    for (const attempt of attempts) {
-      let attemptPath = resolvedPath;
-      if (attempt.file) {
-        attemptPath = resolve(attemptPath, attempt.file);
-      }
-      if (attempt.ext) {
-        attemptPath += attempt.ext;
-      }
-      const stats = statSync(attemptPath, { throwIfNoEntry: false });
-      if (stats?.isFile()) {
-        foundPath = attemptPath;
-        break;
-      }
-    }
-    return foundPath || require.resolve(specifier);
-  }
-
-  /**
-   * @private
-   *
-   * Main function that creates an ApplicationInstance for every `visit` request,
-   * boots it and then visits the given route. Only the instance is destroyed
-   * after rendering — the Application stays alive across requests.
-   *
-   * @param {string} path the URL path to render, like `/photos/1`
-   * @param {Object} fastbootInfo An object holding per request info
-   * @param {Object} bootOptions An object containing the boot options that are used
-   *                             by ember to decide whether it needs to do rendering or not.
-   * @param {Object} result
-   * @return {Promise<instance>} instance
-   */
-  async _visit(path, fastbootInfo, bootOptions, result) {
-    let instance = await this._sharedApp.buildInstance();
+    let instance = await app.buildInstance();
     result.applicationInstanceInstance = instance;
 
     registerFastBootInfo(fastbootInfo, instance);
@@ -335,59 +237,29 @@ export default class EmberApp {
     await fastbootInfo.deferredPromise;
   }
 
-  /**
-   * Creates a new application instance and renders the instance at a specific
-   * URL, returning a promise that resolves to a {@link Result}. The `Result`
-   * gives you access to the rendered HTML as well as metadata about the
-   * request such as the HTTP status code.
-   *
-   * If this call to `visit()` is to service an incoming HTTP request, you may
-   * provide Node's `ClientRequest` and `ServerResponse` objects as options
-   * (e.g., the `res` and `req` arguments passed to Express middleware).  These
-   * are provided to the Ember application via the FastBoot service.
-   *
-   * @param {string} path the URL path to render, like `/photos/1`
-   * @param {Object} options
-   * @param {string} [options.html] the HTML document to insert the rendered app into
-   * @param {Object} [options.metadata] Per request specific data used in the app.
-   * @param {Boolean} [options.shouldRender] whether the app should do rendering or not. If set to false, it puts the app in routing-only.
-   * @param {Boolean} [options.disableShoebox] whether we should send the API data in the shoebox. If set to false, it will not send the API data used for rendering the app on server side in the index.html.
-   * @param {Integer} [options.destroyAppInstanceInMs] whether to destroy the instance in the given number of ms. This is a failure mechanism to not wedge the Node process (See: https://github.com/ember-fastboot/fastboot/issues/90)
-   * @param {ClientRequest}
-   * @param {ClientResponse}
-   * @returns {Promise<Result>} result
-   */
   async visit(path, options) {
-    // Wait for the shared Application to be ready
-    await this._ready;
-
-    if (!this._sharedApp) {
-      throw new Error('SSR application failed to initialize');
-    }
-
     const req = options.request;
     const res = options.response;
     const html = options.html || this.html;
     const disableShoebox = options.disableShoebox || false;
     const destroyAppInstanceInMs = parseInt(options.destroyAppInstanceInMs, 10);
 
-    // Fresh document per request
-    const doc = this.buildSandboxDocument();
-    this._sharedContext.document = doc;
-
-    const configMeta = doc.querySelector(`meta[name="${this.appName}/config/environment"]`);
-    if (configMeta) configMeta.remove();
-
     const fastbootInfo = new FastBootInfo(req, res, {
       hostWhitelist: this.hostWhitelist,
       metadata: options.metadata || {},
     });
 
+    const appContext = await this.buildApp();
+
+    if (!appContext) {
+      return null;
+    }
+
+    const { app, context } = appContext;
+    const doc = context.document;
     const result = new Result(doc, html, fastbootInfo);
 
-    // The Application is NOT destroyed per request — only the instance is.
-    // Store a reference so Result._destroy() can clean up the instance.
-    result.applicationInstance = null;
+    result.applicationInstance = app;
 
     const shouldRender = options.shouldRender !== undefined ? options.shouldRender : true;
     const bootOptions = buildBootOptions(shouldRender, doc);
@@ -395,9 +267,7 @@ export default class EmberApp {
     let destroyAppInstanceTimer;
     if (destroyAppInstanceInMs > 0) {
       destroyAppInstanceTimer = setTimeout(function() {
-        if (result.applicationInstanceInstance && !result.isDestroyed) {
-          result.applicationInstanceInstance.destroy();
-          result.isDestroyed = true;
+        if (result._destroy()) {
           result.error = new Error(
             'App instance was forcefully destroyed in ' + destroyAppInstanceInMs + 'ms'
           );
@@ -412,17 +282,10 @@ export default class EmberApp {
         createShoebox(doc, fastbootInfo);
       }
     } catch (error) {
-      // eslint-disable-next-line require-atomic-updates
       result.error = error;
     } finally {
       result._finalize();
-
-      // Only destroy the ApplicationInstance, not the Application
-      if (result.applicationInstanceInstance) {
-        result.applicationInstanceInstance.destroy();
-      }
-      result.isDestroyed = true;
-
+      result._destroy();
       clearTimeout(destroyAppInstanceTimer);
     }
 
@@ -430,10 +293,6 @@ export default class EmberApp {
   }
 }
 
-/*
- * Builds an object with the options required to boot an ApplicationInstance in
- * FastBoot mode.
- */
 function buildBootOptions(shouldRender, document) {
   let rootElement = document.body;
   let _renderMode = process.env.EXPERIMENTAL_RENDER_MODE_SERIALIZE ? 'serialize' : undefined;
@@ -447,33 +306,18 @@ function buildBootOptions(shouldRender, document) {
   };
 }
 
-/*
- * Writes the shoebox into the DOM for the browser rendered app to consume.
- * Uses a script tag with custom type so that the browser will treat as plain
- * text, and not expend effort trying to parse contents of the script tag.
- * Each key is written separately so that the browser rendered app can
- * parse the specific item at the time it is needed instead of everything
- * all at once.
- */
-const hasOwnProperty = Object.prototype.hasOwnProperty; // jshint ignore:line
+const hasOwnProperty = Object.prototype.hasOwnProperty;
 
 function createShoebox(doc, fastbootInfo) {
   let shoebox = fastbootInfo.shoebox;
-  if (!shoebox) {
-    return;
-  }
+  if (!shoebox) return;
 
   for (let key in shoebox) {
-    if (!hasOwnProperty.call(shoebox, key)) {
-      continue;
-    } // TODO: remove this later #144, ember-fastboot/ember-cli-fastboot/pull/417
+    if (!hasOwnProperty.call(shoebox, key)) continue;
     let value = shoebox[key];
-    let textValue = JSON.stringify(value);
-    textValue = escapeJSONString(textValue);
-
+    let textValue = escapeJSONString(JSON.stringify(value));
     let scriptText = doc.createRawHTMLSection(textValue);
     let scriptEl = doc.createElement('script');
-
     scriptEl.setAttribute('type', 'fastboot/shoebox');
     scriptEl.setAttribute('id', `shoebox-${key}`);
     scriptEl.appendChild(scriptText);
@@ -492,15 +336,9 @@ const JSON_ESCAPE = {
 const JSON_ESCAPE_REGEXP = /[\u2028\u2029&><]/g;
 
 function escapeJSONString(string) {
-  return string.replace(JSON_ESCAPE_REGEXP, function(match) {
-    return JSON_ESCAPE[match];
-  });
+  return string.replace(JSON_ESCAPE_REGEXP, match => JSON_ESCAPE[match]);
 }
 
-/*
- * Builds a new FastBootInfo instance with the request and response and injects
- * it into the application instance.
- */
 function registerFastBootInfo(info, instance) {
   info.register(instance);
 }

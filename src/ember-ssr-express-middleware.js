@@ -16,14 +16,10 @@ export default function emberSsrExpressMiddleware(options = {}) {
     });
   }
 
-  let requestCount = 0;
-
   return async function(req, res, next) {
     const path = req.url;
-    requestCount++;
 
     try {
-      const memBefore = process.memoryUsage();
       const visitOptions = Object.assign({}, options.visitOptions, {
         request: req, response: res,
       });
@@ -47,11 +43,7 @@ export default function emberSsrExpressMiddleware(options = {}) {
         res.append(pair[0], pair[1]);
       }
 
-      const memAfter = process.memoryUsage();
-      const heapDelta = ((memAfter.heapUsed - memBefore.heapUsed) / 1024 / 1024).toFixed(2);
-      const heapTotal = (memAfter.heapUsed / 1024 / 1024).toFixed(1);
-      const rss = (memAfter.rss / 1024 / 1024).toFixed(1);
-      log(result.statusCode, statusMessage + path + ` [req#${requestCount} heap:${heapTotal}MB rss:${rss}MB delta:${heapDelta}MB]`);
+      log(result.statusCode, statusMessage + path);
       res.status(result.statusCode);
 
       if (typeof body === 'string') {
