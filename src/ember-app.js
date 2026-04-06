@@ -243,10 +243,10 @@ export default class EmberApp {
     const importModuleDynamically = async specifier => {
       return (await link(specifier)).namespace;
     };
-    const builtinCache = new Map();
+    const moduleCache = new Map();
     const link = async (specifier, referencingModule) => {
       if (nodeBuiltins.has(specifier)) {
-        if (builtinCache.has(specifier)) return builtinCache.get(specifier);
+        if (moduleCache.has(specifier)) return moduleCache.get(specifier);
         const canonical = specifier.startsWith('node:') ? specifier : `node:${specifier}`;
         const native = await import(canonical);
         const exportNames = Object.keys(native);
@@ -262,15 +262,20 @@ export default class EmberApp {
         );
         await synth.link(() => {});
         await synth.evaluate();
-        builtinCache.set(specifier, synth);
+        moduleCache.set(specifier, synth);
         return synth;
       }
       const base = referencingModule?.identifier || defaultBase;
       const identifier = await this.resolveImport(specifier, base);
+      // Cache compiled modules by resolved path. Without this, every
+      // dynamic import during SSR compiles a new SourceTextModule,
+      // which are never freed and accumulate until OOM.
+      if (moduleCache.has(identifier)) return moduleCache.get(identifier);
       const module = await this.buildScript(
         identifier, context, link, importModuleDynamically,
       );
       await module.evaluate();
+      moduleCache.set(identifier, module);
       return module;
     };
     return { link, importModuleDynamically };
