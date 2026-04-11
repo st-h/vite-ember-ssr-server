@@ -1,4 +1,4 @@
-const SHOEBOX_TAG_PATTERN = '<script type="ssr/shoebox"';
+const SHOEBOX_TAG_PATTERN = '<script type="fastboot/shoebox"';
 const HTML_HEAD_REGEX = /^([\s\S]*<\/head>)([\s\S]*)/;
 
 /**
@@ -41,7 +41,14 @@ export default class Result {
       this._body = '';
 
       if (location) {
-        this._body = `<h1>Redirecting to <a href="${location}">${location}</a></h1>`;
+        let safeLocation = location
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#x27;');
+        let safeHref = /^https?:\/\//i.test(location) || location.startsWith('/') ? safeLocation : '#';
+        this._body = `<h1>Redirecting to <a href="${safeHref}">${safeLocation}</a></h1>`;
       }
     }
 
@@ -191,7 +198,7 @@ export default class Result {
     this._head = head;
 
     // Adding script boundary around the body
-    this._body = `<script type="x/boundary" id="ssr-body-start"></script>${body}<script type="x/boundary" id="ssr-body-end"></script>`;
+    this._body = `<script type="x/boundary" id="fastboot-body-start"></script>${body}<script type="x/boundary" id="fastboot-body-end"></script>`;
   }
 }
 
@@ -227,9 +234,6 @@ function serializeAttributes(attributes) {
 }
 
 function serializeAttribute(attr) {
-  if (!attr.specified) {
-    return '';
-  }
   if (attr.value) {
     return ' ' + attr.name + '="' + escapeAttrValue(attr.value) + '"';
   }
